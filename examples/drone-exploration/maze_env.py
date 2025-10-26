@@ -75,7 +75,7 @@ class BoxMaze:
 
 class MazeEnv:
     def __init__(self, num_envs: int = 1, grid_size: Tuple[int, int] = (11, 11), seed: int | None = None,
-                 show_viewer: bool = False, episode_length_s: float = 60.0):
+                 show_viewer: bool = False, episode_length_s: float = 60.0, visualize_camera: bool = False):
         self.num_envs = num_envs
         self.dt = 0.01
         self.max_FPS = 60
@@ -90,7 +90,7 @@ class MazeEnv:
         self.num_privileged_obs = None
         self.num_actions = 3  # pitch, yaw, roll
 
-        self._build_scene(show_viewer)
+        self._build_scene(show_viewer, visualize_camera)
 
         # set runner device
         self.device = gs.device
@@ -120,8 +120,9 @@ class MazeEnv:
         self.episode_step = torch.zeros((self.num_envs,), device=gs.device, dtype=gs.tc_int)
         self.extras = {"observations": {}}
 
-    def _build_scene(self, show_viewer: bool):
-        gs.init(backend=gs.cpu, logging_level="warning")
+    def _build_scene(self, show_viewer: bool, visualize_camera: bool):
+        if not getattr(gs, "_initialized", False):
+            gs.init(backend=gs.cpu, logging_level="warning")
         self.scene = gs.Scene(
             sim_options=gs.options.SimOptions(dt=self.dt, substeps=2),
             viewer_options=gs.options.ViewerOptions(
@@ -130,7 +131,8 @@ class MazeEnv:
                 camera_fov=45,
                 max_FPS=self.max_FPS,
             ),
-            vis_options=gs.options.VisOptions(rendered_envs_idx=list(range(min(10, self.num_envs)))),
+            vis_options=gs.options.VisOptions(rendered_envs_idx=list(range(1))),
+            # vis_options = gs.options.VisOptions(rendered_envs_idx=[0,1,2,5]),
             rigid_options=gs.options.RigidOptions(
                 dt=self.dt,
                 constraint_solver=gs.constraint_solver.Newton,
@@ -176,6 +178,20 @@ class MazeEnv:
                 draw_debug=True,
             )
         )
+
+        # optional offscreen camera for recording by the runner
+        self.cam = None
+        if visualize_camera:
+            try:
+                self.cam = self.scene.add_camera(
+                    res=(640, 480),
+                    pos=(0.0, -2.0, 1.0),
+                    lookat=(0.0, 0.0, 0.5),
+                    fov=45,
+                    GUI=False,
+                )
+            except Exception:
+                self.cam = None
 
         self.scene.build(n_envs=self.num_envs)
 

@@ -18,13 +18,13 @@ except Exception:
     RSL_AVAILABLE = False
 
 
-def make_env(show_viewer=False, n_envs=1, episode_length_s=90.0):
-    return MazeEnv(num_envs=n_envs, grid_size=(11, 11), seed=1, show_viewer=show_viewer, episode_length_s=episode_length_s)
+def make_env(show_viewer=False, n_envs=1, episode_length_s=90.0, visualize_camera=False):
+    return MazeEnv(num_envs=n_envs, grid_size=(11, 11), seed=1, show_viewer=show_viewer, episode_length_s=episode_length_s, visualize_camera=visualize_camera)
 
 
 def train_ddpg(args):
     env = make_env(show_viewer=args.vis, n_envs=1, episode_length_s=args.episode_length_s)
-    log_dir = os.path.join("logs", "drone-exploration-ddpg")
+    log_dir = os.path.join("logs", "drone-exploration-ddpg", args.exp_name)
     os.makedirs(log_dir, exist_ok=True)
     writer = SummaryWriter(log_dir=log_dir)
     obs, _ = env.reset()
@@ -85,7 +85,8 @@ def train_ddpg(args):
 def train_ppo(args):
     if not RSL_AVAILABLE:
         raise ImportError("PPO option requires rsl-rl-lib installed.")
-    env = make_env(show_viewer=args.vis, n_envs=args.num_envs, episode_length_s=args.episode_length_s)
+    # enable offscreen camera if we intend to record
+    env = make_env(show_viewer=args.vis, n_envs=args.num_envs, episode_length_s=args.episode_length_s, visualize_camera=(args.record_interval and args.record_interval > 0))
 
     # minimal PPO config leveraging rsl-rl runner
     train_cfg = {
@@ -129,6 +130,9 @@ def train_ppo(args):
         "seed": 1,
     }
 
+    # set run name from exp_name while keeping base logs directory unchanged
+    train_cfg["runner"]["run_name"] = args.exp_name
+
     log_dir = os.path.join("logs", "drone-exploration-ppo")
     os.makedirs(log_dir, exist_ok=True)
     runner = OnPolicyRunner(env, train_cfg, log_dir, device=gs.device)
@@ -145,8 +149,11 @@ if __name__ == "__main__":
     parser.add_argument("--ppo_iters", type=int, default=301)
     parser.add_argument("-B", "--num_envs", type=int, default=2048)
     parser.add_argument("--episode_length_s", type=float, default=90.0)
-    parser.add_argument("--record_interval", type=int, default=-1)
+    parser.add_argument("--record_interval", type=int, default=-1, help="Every N iterations, record a rollout if env has camera")
     parser.add_argument("-v", "--vis", action="store_true", default=False)
+    # accept both --exp_name and --run_name, mapping to the same destination
+    parser.add_argument("-e", "--exp_name", dest="exp_name", type=str, default="drone-exploration")
+    parser.add_argument("--run_name", dest="exp_name", type=str, help="alias for --exp_name")
     args = parser.parse_args()
 
     if args.algo.startswith("ddpg"):

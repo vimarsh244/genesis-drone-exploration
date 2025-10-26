@@ -1,4 +1,27 @@
-# Drone Examples
+# Drone Exploration details
+
+# Install
+
+go to Genesis/ root and install by running:
+```
+pip install -e ".[dev]"
+```
+
+## run 
+
+**PPO:**
+
+```
+python3 train_exploration.py --algo ppo -B 256 --episode_length_s 120
+```
+
+**DDPG:**
+
+```
+python3 train_exploration.py --algo ddpg-mc -B 256 --episode_length_s 120
+```
+
+==============
 
 This directory contains examples of drone simulations using the Genesis framework.
 
