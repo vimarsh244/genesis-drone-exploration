@@ -75,7 +75,7 @@ class BoxMaze:
 
 class MazeEnv:
     def __init__(self, num_envs: int = 1, grid_size: Tuple[int, int] = (11, 11), seed: int | None = None,
-                 show_viewer: bool = False):
+                 show_viewer: bool = False, episode_length_s: float = 60.0):
         self.num_envs = num_envs
         self.dt = 0.01
         self.max_FPS = 60
@@ -114,7 +114,8 @@ class MazeEnv:
         self.F_threshold = 1.5  # front sector safe dist in meters
         self.step_reward_scale = self.dt
 
-        self.max_episode_length = int(30.0 / self.dt)
+        # max steps per episode (configurable)
+        self.max_episode_length = int(float(episode_length_s) / self.dt)
         self.episode_length_buf = torch.zeros((self.num_envs,), device=gs.device, dtype=gs.tc_int)
         self.episode_step = torch.zeros((self.num_envs,), device=gs.device, dtype=gs.tc_int)
         self.extras = {"observations": {}}
@@ -180,17 +181,25 @@ class MazeEnv:
 
     def _read_lidar(self):
         data = self.lidar.read()
-        dists = data.distances.reshape(-1)
+        dists = data.distances
+        # reshape to (B, N_rays)
+        if dists.dim() == 1:
+            dists = dists.reshape(1, -1)
+        else:
+            # if pattern is 2D like (181,1) or batched (B,181,1), flatten spatial dims
+            B = self.num_envs if self.num_envs > 0 else 1
+            dists = dists.reshape(B, -1)
         dists = torch.clamp(dists, 0.0, 6.0)
         return dists
 
     def _compute_frontal_sectors(self, dists: torch.Tensor):
+        # dists shape: (B, N)
         front_idx = slice(80, 101)
         left_idx = slice(0, 80)
         right_idx = slice(101, 181)
-        F = torch.min(dists[front_idx]).reshape(1)
-        L = torch.min(dists[left_idx]).reshape(1)
-        R = torch.min(dists[right_idx]).reshape(1)
+        F = torch.min(dists[:, front_idx], dim=1).values
+        L = torch.min(dists[:, left_idx], dim=1).values
+        R = torch.min(dists[:, right_idx], dim=1).values
         return F, R, L
 
     def _map_actions_to_rpms(self, actions: torch.Tensor) -> torch.Tensor:
@@ -255,30 +264,52 @@ class MazeEnv:
                          torch.where(cond2, self.kappa / torch.clamp(rep_eq, min=eps), r2_neg))
         # reward_3
         U_attr = -self.mu * (R - L) ** 2 + self.delta_const
+        # follow paper eq14: reward_3 doubles when moving toward center; approximate with always 2*U_attr for stability
         r3 = 2.0 * U_attr
 
-        return r1, r2, r3, rep_eq
+        return r1.reshape(-1), r2.reshape(-1), r3.reshape(-1), rep_eq.reshape(-1)
 
     def reset(self):
         self.reset_buf[:] = True
         self.episode_step[:] = 0
         self.episode_length_buf[:] = 0
-        free_cells = np.argwhere(self.maze.grid == 0)
-        ci, cj = free_cells[self.rng.randrange(len(free_cells))]
-        cell = self.maze.corridor + self.maze.wall_t
-        x = (cj - self.grid_size[1] / 2.0 + 0.5) * cell
-        y = (ci - self.grid_size[0] / 2.0 + 0.5) * cell
-        self.drone.set_pos(_gs_tensor([x, y, 0.35], like_shape=(self.num_envs,)))
-        self.drone.set_quat(_gs_tensor([1.0, 0.0, 0.0, 0.0], like_shape=(self.num_envs,)))
-        self.prev_rep_eq[:] = 1.0
-        self.last_actions[:] = 0.0
+        # reset all envs
+        self.reset_idx(torch.arange(self.num_envs, device=gs.device, dtype=gs.tc_int))
         self.scene.step()
         return self._observe(), None
+
+    def reset_idx(self, envs_idx):
+        if envs_idx is None:
+            return
+        if isinstance(envs_idx, torch.Tensor):
+            idx = envs_idx.reshape(-1)
+        else:
+            idx = torch.as_tensor(envs_idx, device=gs.device, dtype=gs.tc_int).reshape(-1)
+
+        free_cells = np.argwhere(self.maze.grid == 0)
+        cell = self.maze.corridor + self.maze.wall_t
+        # sample start positions per env to diversify
+        XY = []
+        for _ in range(idx.numel()):
+            ci, cj = free_cells[self.rng.randrange(len(free_cells))]
+            x = (cj - self.grid_size[1] / 2.0 + 0.5) * cell
+            y = (ci - self.grid_size[0] / 2.0 + 0.5) * cell
+            XY.append((x, y))
+        pos = torch.tensor([[x, y, 0.35] for (x, y) in XY], device=gs.device, dtype=gs.tc_float)
+        quat = torch.tensor([[1.0, 0.0, 0.0, 0.0]] * idx.numel(), device=gs.device, dtype=gs.tc_float)
+        self.drone.set_pos(pos, zero_velocity=True, envs_idx=idx)
+        self.drone.set_quat(quat, zero_velocity=True, envs_idx=idx)
+        self.prev_rep_eq[idx] = 1.0
+        self.last_actions[idx] = 0.0
+        self.episode_length_buf[idx] = 0
+        self.reset_buf[idx] = True
 
     def _observe(self):
         dists = self._read_lidar()
         F, R, L = self._compute_frontal_sectors(dists)
-        self.obs_buf[:] = torch.tensor([F, R, L], device=gs.device, dtype=gs.tc_float)
+        self.obs_buf[:, 0] = F
+        self.obs_buf[:, 1] = R
+        self.obs_buf[:, 2] = L
         self.extras["observations"]["critic"] = self.obs_buf
         return self.obs_buf
 
@@ -306,22 +337,25 @@ class MazeEnv:
         self.episode_step += 1
         self.episode_length_buf += 1
         timeout = self.episode_length_buf > self.max_episode_length
-        crash = (F < 0.2) or (R < 0.15) or (L < 0.15)
-        done = crash or bool(timeout[0].item()) if torch.is_tensor(timeout) else (crash or timeout)
-        self.reset_buf[:] = done
+        crash_condition = (F < 0.2) | (R < 0.15) | (L < 0.15)
+        self.reset_buf = (timeout | crash_condition).to(dtype=gs.tc_int)
 
         time_outs = torch.zeros_like(self.reset_buf, device=gs.device, dtype=gs.tc_float)
-        if torch.is_tensor(timeout):
-            time_outs[timeout.nonzero(as_tuple=False).reshape((-1,))] = 1.0
+        time_outs[timeout.nonzero(as_tuple=False).reshape((-1,))] = 1.0
         self.extras["time_outs"] = time_outs
 
-        self.obs_buf[:] = torch.tensor([F, R, L], device=gs.device, dtype=gs.tc_float)
+        self.obs_buf[:, 0] = F
+        self.obs_buf[:, 1] = R
+        self.obs_buf[:, 2] = L
         self.extras["observations"]["critic"] = self.obs_buf
         self.last_actions[:] = actions
 
-        _components = torch.cat([r1.reshape(-1), r2.reshape(-1), r3.reshape(-1)], dim=0)
-        self.extras["reward_components"] = _components
+        # shape (B, 3): r1, r2, r3
+        components = torch.stack([r1, r2, r3], dim=-1)
+        self.extras["components"] = components
 
-        if done:
-            self.reset()
+        # reset only done envs
+        done_idx = self.reset_buf.nonzero(as_tuple=False).reshape((-1,))
+        if done_idx.numel() > 0:
+            self.reset_idx(done_idx)
         return self.obs_buf, self.rew_buf, self.reset_buf, self.extras

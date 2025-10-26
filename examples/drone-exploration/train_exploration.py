@@ -8,6 +8,7 @@ import genesis as gs
 
 from maze_env import MazeEnv
 from ddpg_agents import DDPGConfig, DDPGAgent, ReplayBuffer
+from torch.utils.tensorboard import SummaryWriter
 
 
 try:
@@ -17,12 +18,15 @@ except Exception:
     RSL_AVAILABLE = False
 
 
-def make_env(show_viewer=False):
-    return MazeEnv(num_envs=1, grid_size=(11, 11), seed=1, show_viewer=show_viewer)
+def make_env(show_viewer=False, n_envs=1, episode_length_s=90.0):
+    return MazeEnv(num_envs=n_envs, grid_size=(11, 11), seed=1, show_viewer=show_viewer, episode_length_s=episode_length_s)
 
 
 def train_ddpg(args):
-    env = make_env(show_viewer=args.vis)
+    env = make_env(show_viewer=args.vis, n_envs=1, episode_length_s=args.episode_length_s)
+    log_dir = os.path.join("logs", "drone-exploration-ddpg")
+    os.makedirs(log_dir, exist_ok=True)
+    writer = SummaryWriter(log_dir=log_dir)
     obs, _ = env.reset()
     obs_dim = env.num_obs
     cfg = DDPGConfig(obs_dim=obs_dim, multi_critic=(args.algo == "ddpg-mc"), lr=args.lr, batch_size=args.batch_size)
@@ -38,6 +42,7 @@ def train_ddpg(args):
     ep_ret = 0.0
     ep_len = 0
 
+    last_losses = None
     for t in range(1, total_steps + 1):
         if t < start_steps:
             a = torch.tensor([[1.5 * torch.rand(1), 20.0 * (torch.rand(1) - 0.5), 2.0 * (torch.rand(1) - 0.5)]], dtype=torch.float32).squeeze(0)
@@ -45,7 +50,8 @@ def train_ddpg(args):
             with torch.no_grad():
                 a = agent.act(torch.as_tensor(o, dtype=torch.float32).unsqueeze(0), add_noise=True).squeeze(0)
         next_obs, rew, done, extras = env.step(a.unsqueeze(0))
-        r_components = extras.get("components", torch.zeros(3))
+        comps = extras.get("components", torch.zeros((1, 3)))
+        r_components = comps.reshape(-1)
         o2 = next_obs.cpu().numpy().squeeze(0)
         d = float(done.item())
         buf.store(o, a.cpu().numpy(), r_components.cpu().numpy(), o2, d)
@@ -53,6 +59,8 @@ def train_ddpg(args):
         ep_ret += rew.item()
         ep_len += 1
         if done:
+            writer.add_scalar("train/ep_return", ep_ret, t)
+            writer.add_scalar("train/ep_length", ep_len, t)
             obs, _ = env.reset()
             o = obs.cpu().numpy().squeeze(0)
             ep_ret = 0.0
@@ -61,18 +69,23 @@ def train_ddpg(args):
         if t >= update_after and t % update_every == 0:
             for _ in range(update_every):
                 batch = buf.sample_batch(args.batch_size)
-                agent.update(batch)
+                last_losses = agent.update(batch)
+            if last_losses is not None:
+                writer.add_scalar("loss/critic", last_losses.get("critic_loss", 0.0), t)
+                writer.add_scalar("loss/actor", last_losses.get("actor_loss", 0.0), t)
 
         if t % 1000 == 0:
             print(f"step {t}/{total_steps}")
 
     print("training complete")
+    writer.flush()
+    writer.close()
 
 
 def train_ppo(args):
     if not RSL_AVAILABLE:
         raise ImportError("PPO option requires rsl-rl-lib installed.")
-    env = make_env(show_viewer=args.vis)
+    env = make_env(show_viewer=args.vis, n_envs=args.num_envs, episode_length_s=args.episode_length_s)
 
     # minimal PPO config leveraging rsl-rl runner
     train_cfg = {
@@ -104,7 +117,7 @@ def train_ppo(args):
             "load_run": -1,
             "log_interval": 1,
             "max_iterations": args.ppo_iters,
-            "record_interval": -1,
+            "record_interval": args.record_interval,
             "resume": False,
             "resume_path": None,
             "run_name": "",
@@ -130,6 +143,9 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--ppo_iters", type=int, default=301)
+    parser.add_argument("-B", "--num_envs", type=int, default=2048)
+    parser.add_argument("--episode_length_s", type=float, default=90.0)
+    parser.add_argument("--record_interval", type=int, default=-1)
     parser.add_argument("-v", "--vis", action="store_true", default=False)
     args = parser.parse_args()
 
