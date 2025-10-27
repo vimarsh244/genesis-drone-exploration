@@ -21,6 +21,13 @@ python3 train_exploration.py --algo ppo -B 256 --episode_length_s 120
 python3 train_exploration.py --algo ddpg-mc -B 256 --episode_length_s 120
 ```
 
+
+### Evaluate already trained model
+
+```
+python3 exploration_eval.py -e drone-exploration-ppo-2048-1000rounds --ckpt 999 --record
+```
+
 ==============
 
 This directory contains examples of drone simulations using the Genesis framework.

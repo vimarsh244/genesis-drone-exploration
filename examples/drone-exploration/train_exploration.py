@@ -23,6 +23,10 @@ def make_env(show_viewer=False, n_envs=1, episode_length_s=90.0, visualize_camer
 
 
 def train_ddpg(args):
+    # ensure genesis uses gpu so tensors and sim run on the same device
+    if not getattr(gs, "_initialized", False):
+        gs.init(backend=gs.gpu, logging_level="warning")
+
     env = make_env(show_viewer=args.vis, n_envs=1, episode_length_s=args.episode_length_s)
     log_dir = os.path.join("logs", "drone-exploration-ddpg", args.exp_name)
     os.makedirs(log_dir, exist_ok=True)
@@ -38,53 +42,276 @@ def train_ddpg(args):
     update_after = 1000
     update_every = 50
 
-    o = obs.clone().cpu().numpy().squeeze(0)
+    # keep current observation as a tensor on simulation/device
+    o = obs.squeeze(0)
     ep_ret = 0.0
     ep_len = 0
+    ep_start_time = time.time()
+    
+    # tracking for individual reward components
+    ep_r1 = 0.0
+    ep_r2 = 0.0
+    ep_r3 = 0.0
+    
+    # tracking for moving averages
+    episode_returns = []
+    episode_lengths = []
+    episode_times = []
 
     last_losses = None
     for t in range(1, total_steps + 1):
         if t < start_steps:
-            a = torch.tensor([[1.5 * torch.rand(1), 20.0 * (torch.rand(1) - 0.5), 2.0 * (torch.rand(1) - 0.5)]], dtype=torch.float32).squeeze(0)
+            a = torch.tensor([[1.5 * torch.rand(1, device=gs.device), 20.0 * (torch.rand(1, device=gs.device) - 0.5), 2.0 * (torch.rand(1, device=gs.device) - 0.5)]], dtype=torch.float32, device=gs.device).squeeze(0)
         else:
             with torch.no_grad():
-                a = agent.act(torch.as_tensor(o, dtype=torch.float32).unsqueeze(0), add_noise=True).squeeze(0)
+                a = agent.act(o.unsqueeze(0), add_noise=True).squeeze(0)
         next_obs, rew, done, extras = env.step(a.unsqueeze(0))
-        comps = extras.get("components", torch.zeros((1, 3)))
+        comps = extras.get("components", torch.zeros((1, 3), device=gs.device))
         r_components = comps.reshape(-1)
-        o2 = next_obs.cpu().numpy().squeeze(0)
+        o2 = next_obs.squeeze(0)
         d = float(done.item())
-        buf.store(o, a.cpu().numpy(), r_components.cpu().numpy(), o2, d)
+        # store cpu copies in the replay buffer
+        buf.store(o.detach().cpu().numpy(), a.detach().cpu().numpy(), r_components.detach().cpu().numpy(), o2.detach().cpu().numpy(), d)
         o = o2
         ep_ret += rew.item()
         ep_len += 1
+        
+        # accumulate individual reward components
+        ep_r1 += r_components[0].item()
+        ep_r2 += r_components[1].item()
+        ep_r3 += r_components[2].item()
+        
         if done:
+            ep_time = time.time() - ep_start_time
+            
+            # log episode metrics
             writer.add_scalar("train/ep_return", ep_ret, t)
             writer.add_scalar("train/ep_length", ep_len, t)
+            writer.add_scalar("train/ep_time", ep_time, t)
+            
+            # log individual reward components
+            writer.add_scalar("train/ep_reward_r1_pitch", ep_r1, t)
+            writer.add_scalar("train/ep_reward_r2_yaw", ep_r2, t)
+            writer.add_scalar("train/ep_reward_r3_roll", ep_r3, t)
+            
+            # update moving averages
+            episode_returns.append(ep_ret)
+            episode_lengths.append(ep_len)
+            episode_times.append(ep_time)
+            
+            # keep only last 100 episodes for moving average
+            if len(episode_returns) > 100:
+                episode_returns.pop(0)
+                episode_lengths.pop(0)
+                episode_times.pop(0)
+            
+            # log moving averages
+            writer.add_scalar("train/mean_ep_return", sum(episode_returns) / len(episode_returns), t)
+            writer.add_scalar("train/mean_ep_length", sum(episode_lengths) / len(episode_lengths), t)
+            writer.add_scalar("train/mean_ep_time", sum(episode_times) / len(episode_times), t)
+            
             obs, _ = env.reset()
-            o = obs.cpu().numpy().squeeze(0)
+            o = obs.squeeze(0)
             ep_ret = 0.0
             ep_len = 0
+            ep_r1 = 0.0
+            ep_r2 = 0.0
+            ep_r3 = 0.0
+            ep_start_time = time.time()
 
         if t >= update_after and t % update_every == 0:
             for _ in range(update_every):
                 batch = buf.sample_batch(args.batch_size)
                 last_losses = agent.update(batch)
             if last_losses is not None:
+                # log total losses
                 writer.add_scalar("loss/critic", last_losses.get("critic_loss", 0.0), t)
                 writer.add_scalar("loss/actor", last_losses.get("actor_loss", 0.0), t)
+                
+                # log individual critic losses (multi-critic only)
+                if cfg.multi_critic:
+                    writer.add_scalar("loss/critic_pitch", last_losses.get("critic_loss_pitch", 0.0), t)
+                    writer.add_scalar("loss/critic_yaw", last_losses.get("critic_loss_yaw", 0.0), t)
+                    writer.add_scalar("loss/critic_roll", last_losses.get("critic_loss_roll", 0.0), t)
+                    
+                    # log q-values for each critic
+                    writer.add_scalar("value/q_pitch", last_losses.get("q_value_pitch", 0.0), t)
+                    writer.add_scalar("value/q_yaw", last_losses.get("q_value_yaw", 0.0), t)
+                    writer.add_scalar("value/q_roll", last_losses.get("q_value_roll", 0.0), t)
+                    
+                    # log policy q-values
+                    writer.add_scalar("value/policy_q_pitch", last_losses.get("policy_q_pitch", 0.0), t)
+                    writer.add_scalar("value/policy_q_yaw", last_losses.get("policy_q_yaw", 0.0), t)
+                    writer.add_scalar("value/policy_q_roll", last_losses.get("policy_q_roll", 0.0), t)
+                else:
+                    writer.add_scalar("value/q_value", last_losses.get("q_value", 0.0), t)
+                    writer.add_scalar("value/policy_q", last_losses.get("policy_q", 0.0), t)
 
         if t % 1000 == 0:
             print(f"step {t}/{total_steps}")
+            if last_losses is not None:
+                print(f"  critic_loss: {last_losses.get('critic_loss', 0.0):.4f}, actor_loss: {last_losses.get('actor_loss', 0.0):.4f}")
+                if len(episode_returns) > 0:
+                    print(f"  mean_return: {sum(episode_returns) / len(episode_returns):.2f}, mean_ep_len: {sum(episode_lengths) / len(episode_lengths):.1f}")
 
     print("training complete")
     writer.flush()
     writer.close()
 
 
+def train_ppo_custom(args):
+    """Train with custom multi-critic PPO implementation."""
+    import sys
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', '..'))
+    from genesis_drone.models.ppo import PPO
+    
+    # ensure genesis uses gpu so tensors and sim run on the same device
+    if not getattr(gs, "_initialized", False):
+        gs.init(backend=gs.gpu, logging_level="warning")
+    
+    env = make_env(show_viewer=args.vis, n_envs=1, episode_length_s=args.episode_length_s)
+    log_dir = os.path.join("logs", "drone-exploration-ppo-mc", args.exp_name)
+    os.makedirs(log_dir, exist_ok=True)
+    writer = SummaryWriter(log_dir=log_dir)
+    
+    # configure multi-critic PPO
+    ppo_config = {
+        'state_dim': env.num_obs,
+        'action_dim': 3,
+        'hidden_dim': 128,
+        'num_layers': 2,
+        'batch_size': 64,
+        'gamma': 0.99,
+        'clip_param': 0.2,
+        'actor_lr': 3e-4,
+        'critic_lr': 3e-4,
+        'multi_critic': True,
+        'gae_lambda': 0.95,
+        'value_loss_coef': 0.5,
+        'entropy_coef': 0.01,
+        'max_grad_norm': 0.5,
+        'num_mini_batches': 4,
+        'num_epochs': 10,
+        'max_pitch': 1.5,
+        'max_yaw': 10.0,
+        'max_roll': 1.0,
+    }
+    
+    agent = PPO(ppo_config)
+    
+    # training loop
+    total_steps = 0
+    episode_returns = []
+    episode_lengths = []
+    episode_times = []
+    
+    for iteration in range(args.ppo_iters):
+        # reset environment
+        obs, _ = env.reset()
+        o = obs.squeeze(0).cpu().numpy()
+        
+        ep_ret = 0.0
+        ep_len = 0
+        ep_r1 = 0.0
+        ep_r2 = 0.0
+        ep_r3 = 0.0
+        ep_start_time = time.time()
+        done = False
+        
+        # collect rollout
+        rollout_steps = 0
+        max_rollout_steps = args.rollout_length
+        
+        while not done and rollout_steps < max_rollout_steps:
+            # select action
+            action = agent.select_action(o, deterministic=False)
+            
+            # step environment
+            action_tensor = torch.tensor([action], dtype=torch.float32, device=gs.device)
+            next_obs, rew, done_tensor, extras = env.step(action_tensor)
+            
+            # extract reward components
+            comps = extras.get("components", torch.zeros((1, 3), device=gs.device))
+            r_components = comps.reshape(-1).cpu().numpy()
+            
+            # process step
+            agent.process_step(r_components, done_tensor.item())
+            
+            # update tracking
+            o = next_obs.squeeze(0).cpu().numpy()
+            ep_ret += rew.item()
+            ep_len += 1
+            ep_r1 += r_components[0]
+            ep_r2 += r_components[1]
+            ep_r3 += r_components[2]
+            done = done_tensor.item()
+            rollout_steps += 1
+            total_steps += 1
+        
+        # train agent
+        metrics = agent.train()
+        
+        # log episode metrics
+        ep_time = time.time() - ep_start_time
+        
+        writer.add_scalar("train/ep_return", ep_ret, iteration)
+        writer.add_scalar("train/ep_length", ep_len, iteration)
+        writer.add_scalar("train/ep_time", ep_time, iteration)
+        writer.add_scalar("train/ep_reward_r1_pitch", ep_r1, iteration)
+        writer.add_scalar("train/ep_reward_r2_yaw", ep_r2, iteration)
+        writer.add_scalar("train/ep_reward_r3_roll", ep_r3, iteration)
+        
+        # update moving averages
+        episode_returns.append(ep_ret)
+        episode_lengths.append(ep_len)
+        episode_times.append(ep_time)
+        
+        if len(episode_returns) > 100:
+            episode_returns.pop(0)
+            episode_lengths.pop(0)
+            episode_times.pop(0)
+        
+        # log moving averages
+        writer.add_scalar("train/mean_ep_return", sum(episode_returns) / len(episode_returns), iteration)
+        writer.add_scalar("train/mean_ep_length", sum(episode_lengths) / len(episode_lengths), iteration)
+        writer.add_scalar("train/mean_ep_time", sum(episode_times) / len(episode_times), iteration)
+        
+        # log training metrics
+        writer.add_scalar("loss/actor", metrics['actor_loss'], iteration)
+        writer.add_scalar("loss/critic", metrics['critic_loss'], iteration)
+        writer.add_scalar("loss/entropy", metrics['entropy'], iteration)
+        
+        # log individual critic metrics for multi-critic
+        if 'critic_loss_pitch' in metrics:
+            writer.add_scalar("loss/critic_pitch", metrics['critic_loss_pitch'], iteration)
+            writer.add_scalar("loss/critic_yaw", metrics['critic_loss_yaw'], iteration)
+            writer.add_scalar("loss/critic_roll", metrics['critic_loss_roll'], iteration)
+            writer.add_scalar("value/value_pitch", metrics['value_pitch'], iteration)
+            writer.add_scalar("value/value_yaw", metrics['value_yaw'], iteration)
+            writer.add_scalar("value/value_roll", metrics['value_roll'], iteration)
+        
+        # print progress
+        if iteration % 10 == 0:
+            print(f"Iteration {iteration}/{args.ppo_iters}")
+            print(f"  actor_loss: {metrics['actor_loss']:.4f}, critic_loss: {metrics['critic_loss']:.4f}, entropy: {metrics['entropy']:.4f}")
+            if len(episode_returns) > 0:
+                print(f"  mean_return: {sum(episode_returns) / len(episode_returns):.2f}, mean_ep_len: {sum(episode_lengths) / len(episode_lengths):.1f}")
+        
+        # save model periodically
+        if iteration % 100 == 0:
+            model_path = os.path.join(log_dir, f"model_{iteration}.pt")
+            agent.save(model_path)
+    
+    print("training complete")
+    writer.flush()
+    writer.close()
+
 def train_ppo(args):
     if not RSL_AVAILABLE:
         raise ImportError("PPO option requires rsl-rl-lib installed.")
+    # ensure genesis uses gpu so tensors and sim run on the same device
+    if not getattr(gs, "_initialized", False):
+        gs.init(backend=gs.gpu, logging_level="warning")
     # enable offscreen camera if we intend to record
     env = make_env(show_viewer=args.vis, n_envs=args.num_envs, episode_length_s=args.episode_length_s, visualize_camera=(args.record_interval and args.record_interval > 0))
 
@@ -141,12 +368,13 @@ def train_ppo(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--algo", type=str, choices=["ddpg-mc", "ddpg-sc", "ppo"], default="ddpg-mc")
+    parser.add_argument("--algo", type=str, choices=["ddpg-mc", "ddpg-sc", "ppo", "ppo-mc"], default="ddpg-mc")
     parser.add_argument("--steps", type=int, default=50_000)
     parser.add_argument("--buffer_size", type=int, default=200_000)
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--ppo_iters", type=int, default=301)
+    parser.add_argument("--rollout_length", type=int, default=1000, help="Max steps per rollout for PPO-MC")
     parser.add_argument("-B", "--num_envs", type=int, default=2048)
     parser.add_argument("--episode_length_s", type=float, default=90.0)
     parser.add_argument("--record_interval", type=int, default=-1, help="Every N iterations, record a rollout if env has camera")
@@ -158,5 +386,9 @@ if __name__ == "__main__":
 
     if args.algo.startswith("ddpg"):
         train_ddpg(args)
-    else:
+    elif args.algo == "ppo-mc":
+        train_ppo_custom(args)
+    elif args.algo == "ppo":
         train_ppo(args)
+    else:
+        raise ValueError(f"Invalid algorithm: {args.algo}")
